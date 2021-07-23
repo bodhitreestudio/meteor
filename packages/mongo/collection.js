@@ -86,6 +86,16 @@ Mongo.Collection = function Collection(name, options) {
   else
     this._connection = Meteor.server;
 
+  this.openDriver = () => {
+    options._driver = this._driver;
+    this._collection = this._driver.open(name, this._connection);
+  }
+
+  // default, used in the client for example
+  this.asyncInit = async () => {
+    return this;
+  }
+
   if (!options._driver) {
     // XXX This check assumes that webapp is loaded so that Meteor.server !==
     // null. We should fully support the case of "want to use a Mongo-backed
@@ -94,17 +104,28 @@ Mongo.Collection = function Collection(name, options) {
     if (name && this._connection === Meteor.server &&
         typeof MongoInternals !== "undefined" &&
         MongoInternals.defaultRemoteCollectionDriver) {
-      options._driver = MongoInternals.defaultRemoteCollectionDriver();
+
+      if (options.isAsync) {
+        this.asyncInit = async () => {
+          this._driver = await MongoInternals.defaultRemoteCollectionDriver();
+          this.openDriver();
+          return this;
+        }
+      } else {
+        // Promise.await here is ok as this is to keep compatibility for sync
+        // collections
+        this._driver = Promise.await(MongoInternals.defaultRemoteCollectionDriver());
+        this.openDriver();
+      }
     } else {
       const { LocalCollectionDriver } =
         require("./local_collection_driver.js");
-      options._driver = LocalCollectionDriver;
+      this._driver = LocalCollectionDriver;
+      this.openDriver();
     }
   }
 
-  this._collection = options._driver.open(name, this._connection);
   this._name = name;
-  this._driver = options._driver;
 
   this._maybeSetUpReplication(name, options);
 
@@ -141,7 +162,7 @@ Object.assign(Mongo.Collection.prototype, {
   }) {
     const self = this;
     if (! (self._connection &&
-           self._connection.registerStore)) {
+      self._connection.registerStore)) {
       return;
     }
 
@@ -338,6 +359,10 @@ Object.assign(Mongo.Collection.prototype, {
     );
   },
 
+  async findAsync(...args) {
+    return Promise.resolve(this.find(...args));
+  },
+
   /**
    * @summary Finds the first document that matches the selector, as ordered by sort and skip options. Returns `undefined` if no matching document is found.
    * @locus Anywhere
@@ -365,19 +390,19 @@ Object.assign(Mongo.Collection.prototype, {
 Object.assign(Mongo.Collection, {
   _publishCursor(cursor, sub, collection) {
     var observeHandle = cursor.observeChanges({
-      added: function (id, fields) {
-        sub.added(collection, id, fields);
+        added: function (id, fields) {
+          sub.added(collection, id, fields);
+        },
+        changed: function (id, fields) {
+          sub.changed(collection, id, fields);
+        },
+        removed: function (id) {
+          sub.removed(collection, id);
+        }
       },
-      changed: function (id, fields) {
-        sub.changed(collection, id, fields);
-      },
-      removed: function (id) {
-        sub.removed(collection, id);
-      }
-    },
-    // Publications don't mutate the documents
-    // This is tested by the `livedata - publish callbacks clone` test
-    { nonMutatingCallbacks: true });
+      // Publications don't mutate the documents
+      // This is tested by the `livedata - publish callbacks clone` test
+      { nonMutatingCallbacks: true });
 
     // We don't call sub.ready() here: it gets called in livedata_server, after
     // possibly calling _publishCursor on multiple returned cursors.
@@ -416,7 +441,7 @@ Object.assign(Mongo.Collection, {
   }
 });
 
-Object.assign(Mongo.Collection.prototype, {
+const collectionImplementation = {
   // 'insert' immediately returns the inserted document's new _id.
   // The others return values immediately if you are in a stub, an in-memory
   // unmanaged collection, or a mongo-backed collection and you don't pass a
@@ -470,8 +495,8 @@ Object.assign(Mongo.Collection.prototype, {
 
     if ('_id' in doc) {
       if (! doc._id ||
-          ! (typeof doc._id === 'string' ||
-             doc._id instanceof Mongo.ObjectID)) {
+        ! (typeof doc._id === 'string' ||
+          doc._id instanceof Mongo.ObjectID)) {
         throw new Error(
           "Meteor requires document _id fields to be non-empty strings or ObjectIDs");
       }
@@ -722,6 +747,18 @@ Object.assign(Mongo.Collection.prototype, {
     }
     return self._driver.mongo.db;
   }
+};
+
+Object.assign(Mongo.Collection.prototype, collectionImplementation);
+
+Object.keys(collectionImplementation)
+  .forEach(method => {
+    const asyncName = `${method}Async`.replace('_', '');
+    Mongo.Collection.prototype[asyncName] = async function(...args) {
+      const self = this;
+
+      return Promise.resolve(self[method].apply(self, arguments));
+    };
 });
 
 // Convert the callback to not return a result if there is an error
@@ -777,8 +814,26 @@ function popCallbackFromArgs(args) {
   // Pull off any callback (or perhaps a 'callback' variable that was passed
   // in undefined, like how 'upsert' does it).
   if (args.length &&
-      (args[args.length - 1] === undefined ||
-       args[args.length - 1] instanceof Function)) {
+    (args[args.length - 1] === undefined ||
+      args[args.length - 1] instanceof Function)) {
     return args.pop();
+  }
+}
+
+const collections = {};
+
+Mongo.createAsyncCollection = async (collectionName) => {
+  try {
+    if (collections[collectionName]) {
+      return collections[collectionName];
+    }
+
+    const collectionDefinition = new Mongo.Collection(collectionName, { isAsync: true });
+    const collection = await collectionDefinition.asyncInit();
+    collections[collectionName] = collection;
+    return collection;
+  } catch (e) {
+    console.error(`Error creating ${collectionName} async collection`, e);
+    throw e;
   }
 }

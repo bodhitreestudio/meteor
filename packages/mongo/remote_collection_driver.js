@@ -1,7 +1,10 @@
-MongoInternals.RemoteCollectionDriver = function (
+import { onceAsync } from './mongoUtils';
+
+MongoInternals.RemoteCollectionDriver = async function (
   mongo_url, options) {
   var self = this;
-  self.mongo = new MongoConnection(mongo_url, options);
+  self.mongo = await new MongoConnection(mongo_url, options);
+  return self;
 };
 
 _.extend(MongoInternals.RemoteCollectionDriver.prototype, {
@@ -19,11 +22,10 @@ _.extend(MongoInternals.RemoteCollectionDriver.prototype, {
   }
 });
 
-
 // Create the singleton RemoteCollectionDriver only on demand, so we
 // only require Mongo configuration if it's actually used (eg, not if
 // you're only trying to receive data from a remote DDP server.)
-MongoInternals.defaultRemoteCollectionDriver = _.once(function () {
+MongoInternals.defaultRemoteCollectionDriver = onceAsync(async function () {
   var connectionOptions = {};
 
   var mongoUrl = process.env.MONGO_URL;
@@ -35,5 +37,5 @@ MongoInternals.defaultRemoteCollectionDriver = _.once(function () {
   if (! mongoUrl)
     throw new Error("MONGO_URL must be set in environment");
 
-  return new MongoInternals.RemoteCollectionDriver(mongoUrl, connectionOptions);
+  return await new MongoInternals.RemoteCollectionDriver(mongoUrl, connectionOptions);
 });
